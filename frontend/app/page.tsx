@@ -85,7 +85,7 @@ export default function Home() {
     try {
       const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://omnicom.onrender.com";
       const res = await fetch(
-        `${API_BASE}/api/compare?query=${encodeURIComponent(searchQuery)}&page=${pageNum}`
+        `https://omnicom.onrender.com/api/compare?query=${encodeURIComponent(searchQuery)}&page=${pageNum}`
       );
       if (!res.ok) throw new Error("API failed");
       const data: PaginatedResponse = await res.json();
