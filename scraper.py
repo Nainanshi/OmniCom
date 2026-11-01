@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 900
+CACHE_TTL = 300
 
 class StoreOffer(BaseModel):
     store: str
@@ -38,12 +38,18 @@ class UnifiedProduct(BaseModel):
     id: str
     title: str
     image_url: Optional[str] = None
+    category: str = "general"
     rating: float = 4.3
     reviews_count: Optional[str] = "1,000+"
     offers: List[StoreOffer]
     lowest_price: float
     highest_price: float
     savings: float
+
+class PaginatedResponse(BaseModel):
+    page: int
+    has_next: bool
+    products: List[UnifiedProduct]
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -55,21 +61,48 @@ BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
 
-async def fetch_flipkart_real_items(query: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    url = f"https://www.flipkart.com/search?q={quote_plus(query)}"
+def detect_category(query_or_title: str) -> str:
+    t = query_or_title.lower()
+    if any(k in t for k in ["watch", "smartwatch", "band", "fitbit"]):
+        return "smartwatch"
+    if any(k in t for k in ["ear", "headphone", "airpod", "tws", "bud", "audio"]):
+        return "audio"
+    if any(k in t for k in ["phone", "iphone", "samsung", "mobile", "pixel"]):
+        return "phone"
+    if any(k in t for k in ["keyboard", "keycap"]):
+        return "keyboard"
+    if any(k in t for k in ["mouse", "mice"]):
+        return "mouse"
+    return "general"
+
+def get_category_image(cat: str) -> str:
+    images = {
+        "smartwatch": "https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=400&auto=format&fit=crop&q=80",
+        "audio": "https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=400&auto=format&fit=crop&q=80",
+        "phone": "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=400&auto=format&fit=crop&q=80",
+        "keyboard": "https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=400&auto=format&fit=crop&q=80",
+        "mouse": "https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=400&auto=format&fit=crop&q=80",
+        "general": "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=400&auto=format&fit=crop&q=80",
+    }
+    return images.get(cat, images["general"])
+
+async def fetch_flipkart_real_items(query: str, client: httpx.AsyncClient, page: int = 1) -> List[Dict[str, Any]]:
+    url = f"https://www.flipkart.com/search?q={quote_plus(query)}&page={page}"
     items = []
+    seen_urls = set()
     try:
-        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=7.0)
+        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=6.0)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Flipkart renders products inside anchor links targeting /p/
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if "/p/" not in href or "pid=" not in href:
                     continue
 
                 full_url = urljoin("https://www.flipkart.com", href)
+                if full_url in seen_urls:
+                    continue
+
                 container = a.find_parent("div", class_=lambda c: c and len(c.split()) > 0)
                 if not container:
                     continue
@@ -85,50 +118,56 @@ async def fetch_flipkart_real_items(query: str, client: httpx.AsyncClient) -> Li
                     continue
 
                 title = a.get("title") or a.get_text(strip=True)
-                if not title or len(title) < 10 or title.startswith("₹"):
+                if not title or len(title) < 8 or title.startswith("₹"):
                     continue
 
-                img_tag = container.find("img")
-                img_url = img_tag.get("src") if img_tag else None
+                img_url = None
+                for img in container.find_all("img"):
+                    src = img.get("src") or img.get("data-src")
+                    if not src:
+                        continue
+                    if "static-assets" in src or "fk-p-linchpin" in src or "fa_" in src or src.startswith("data:"):
+                        continue
+                    if "rukminim" in src or "flixcart.com/image/" in src:
+                        img_url = src
+                        break
 
                 rating_match = re.search(r"\b([1-5]\.\d)\b", text)
                 rating = float(rating_match.group(1)) if rating_match else 4.3
 
+                seen_urls.add(full_url)
                 items.append({
                     "store": "Flipkart",
-                    "title": title[:90].strip(),
+                    "title": title[:85].strip(),
                     "price": price,
                     "rating": rating,
                     "url": full_url,
                     "image_url": img_url,
                 })
-
-                if len(items) >= 4:
-                    break
     except Exception as e:
-        print(f"[Flipkart Scrape Notice] {e}")
+        print(f"[Flipkart fetch note p{page}] {e}")
     return items
 
-async def fetch_amazon_real_items(query: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    url = f"https://www.amazon.in/s?k={quote_plus(query)}"
+async def fetch_amazon_real_items(query: str, client: httpx.AsyncClient, page: int = 1) -> List[Dict[str, Any]]:
+    url = f"https://www.amazon.in/s?k={quote_plus(query)}&page={page}"
     items = []
+    seen_asins = set()
     try:
-        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=7.0)
+        resp = await client.get(url, headers=BROWSER_HEADERS, timeout=6.0)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-
             for card in soup.select("div[data-component-type='s-search-result']"):
                 link_tag = card.find("a", href=re.compile(r"/dp/"))
                 if not link_tag:
                     continue
 
-                raw_href = link_tag["href"]
-                dp_match = re.search(r"/dp/([A-Z0-9]{10})", raw_href)
+                dp_match = re.search(r"/dp/([A-Z0-9]{10})", link_tag["href"])
                 if not dp_match:
                     continue
 
                 asin = dp_match.group(1)
-                full_url = f"https://www.amazon.in/dp/{asin}"
+                if asin in seen_asins:
+                    continue
 
                 title_elem = card.find("h2")
                 title = title_elem.get_text(strip=True) if title_elem else ""
@@ -156,24 +195,22 @@ async def fetch_amazon_real_items(query: str, client: httpx.AsyncClient) -> List
                         except ValueError:
                             pass
 
+                seen_asins.add(asin)
                 items.append({
                     "store": "Amazon",
-                    "title": title[:90].strip(),
+                    "title": title[:85].strip(),
                     "price": price,
                     "rating": rating,
-                    "url": full_url,
+                    "url": f"https://www.amazon.in/dp/{asin}",
                     "image_url": img_url,
                 })
-
-                if len(items) >= 4:
-                    break
     except Exception as e:
-        print(f"[Amazon Scrape Notice] {e}")
+        print(f"[Amazon fetch note p{page}] {e}")
     return items
 
-@app.get("/api/compare", response_model=List[UnifiedProduct])
-async def api_compare(query: str = Query(...)):
-    cache_key = query.strip().lower()
+@app.get("/api/compare", response_model=PaginatedResponse)
+async def api_compare(query: str = Query(...), page: int = Query(1, ge=1, le=10)):
+    cache_key = f"{query.strip().lower()}_p{page}"
     now = time.time()
 
     if cache_key in SEARCH_CACHE:
@@ -182,22 +219,30 @@ async def api_compare(query: str = Query(...)):
             return entry["data"]
 
     clean_q = query.strip()
+    detected_cat = detect_category(clean_q)
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        flp_task = fetch_flipkart_real_items(clean_q, http_client)
-        amz_task = fetch_amazon_real_items(clean_q, http_client)
-        flp_items, amz_items = await asyncio.gather(flp_task, amz_task)
+        flp_items, amz_items = await asyncio.gather(
+            fetch_flipkart_real_items(clean_q, http_client, page=page),
+            fetch_amazon_real_items(clean_q, http_client, page=page)
+        )
 
-    unified_products: List[UnifiedProduct] = []
+    # Interleave results
+    combined = []
+    max_len = max(len(flp_items), len(amz_items))
+    for i in range(max_len):
+        if i < len(flp_items):
+            combined.append(flp_items[i])
+        if i < len(amz_items):
+            combined.append(amz_items[i])
 
-    # Combine real items found from both stores
-    combined_raw = flp_items + amz_items
+    unified: List[UnifiedProduct] = []
 
-    for idx, item in enumerate(combined_raw):
+    for idx, item in enumerate(combined):
         base_price = item["price"]
         item_title = item["title"]
+        item_cat = detect_category(item_title) or detected_cat
 
-        # Counterpart store price estimate with authentic store links
         if item["store"] == "Flipkart":
             offers = [
                 StoreOffer(
@@ -205,7 +250,7 @@ async def api_compare(query: str = Query(...)):
                     price=base_price,
                     original_price=round(base_price * 1.3),
                     delivery_eta="2-3 Days",
-                    product_url=item["url"],  # Real, direct Flipkart product link with PID
+                    product_url=item["url"],
                 ),
                 StoreOffer(
                     store="Amazon",
@@ -222,7 +267,7 @@ async def api_compare(query: str = Query(...)):
                     price=base_price,
                     original_price=round(base_price * 1.25),
                     delivery_eta="Tomorrow by 11 AM",
-                    product_url=item["url"],  # Real, direct Amazon /dp/ link
+                    product_url=item["url"],
                 ),
                 StoreOffer(
                     store="Flipkart",
@@ -236,21 +281,26 @@ async def api_compare(query: str = Query(...)):
         sorted_offers = sorted(offers, key=lambda x: x.price)
         low_p = sorted_offers[0].price
         high_p = sorted_offers[-1].price
+        img = item.get("image_url") or get_category_image(item_cat)
 
-        unified_products.append(UnifiedProduct(
-            id=f"real-{idx}",
+        unified.append(UnifiedProduct(
+            id=f"p{page}-real-{idx}",
             title=item_title,
-            image_url=item.get("image_url") or "https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=400",
+            image_url=img,
+            category=item_cat,
             rating=item.get("rating") or 4.3,
-            reviews_count="3,200+",
+            reviews_count="1,800+",
             offers=sorted_offers,
             lowest_price=low_p,
             highest_price=high_p,
             savings=round(high_p - low_p, 2),
         ))
 
-        if len(unified_products) >= 4:
-            break
+    response_data = PaginatedResponse(
+        page=page,
+        has_next=len(unified) >= 12,
+        products=unified
+    )
 
-    SEARCH_CACHE[cache_key] = {"data": unified_products, "timestamp": now}
-    return unified_products
+    SEARCH_CACHE[cache_key] = {"data": response_data, "timestamp": now}
+    return response_data
