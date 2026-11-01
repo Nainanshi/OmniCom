@@ -1,4 +1,26 @@
-.venv/
-.env
+# Python & Virtual Env
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+*.env
+.env.local
+
+# Node & Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS & Editor
+.DS_Store
+Thumbs.db
 .vscode/
+.idea/
